@@ -1,0 +1,102 @@
+name: Build and publish Black Edition
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find and extract source archive
+        run: |
+          ZIP=$(find . -maxdepth 1 -name '*.zip' | head -n 1)
+          if [ -n "$ZIP" ]; then unzip -o "$ZIP" -d .; fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK (main branch)
+        if: startsWith(github.ref, 'refs/heads/')
+        run: gradle assembleDebug
+
+      - name: Upload debug APK
+        if: startsWith(github.ref, 'refs/heads/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: black-edition-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Check release signing secrets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || (echo "Missing GitHub Actions secret KEYSTORE_BASE64" && exit 1)
+          test -n "$KEYSTORE_PASSWORD" || (echo "Missing GitHub Actions secret KEYSTORE_PASSWORD" && exit 1)
+          test -n "$KEY_ALIAS" || (echo "Missing GitHub Actions secret KEY_ALIAS" && exit 1)
+          test -n "$KEY_PASSWORD" || (echo "Missing GitHub Actions secret KEY_PASSWORD" && exit 1)
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/black-edition-release.jks"
+          keytool -list -keystore "$RUNNER_TEMP/black-edition-release.jks" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+
+      - name: Build signed release APK
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          KEYSTORE_FILE: ${{ runner.temp }}/black-edition-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease
+
+      - name: Prepare release assets and update manifest
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION_NAME=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' app/build.gradle.kts | head -n 1)
+          VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' app/build.gradle.kts | head -n 1)
+          APK_NAME="BlackEdition-${VERSION_NAME}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$APK_NAME"
+          SHA256=$(sha256sum "$APK_NAME" | awk '{print $1}')
+          python3 - "$VERSION_CODE" "$VERSION_NAME" "$APK_NAME" "$SHA256" > black-edition-update.json <<'PY'
+          import json,sys
+          version_code,version_name,apk_name,sha256=sys.argv[1:]
+          print(json.dumps({
+            "versionCode": int(version_code),
+            "versionName": version_name,
+            "apkAsset": apk_name,
+            "sha256": sha256,
+            "notes": "Black Edition " + version_name + "\nОбновление приложения и исправления."
+          }, ensure_ascii=False, indent=2))
+          PY
+          echo "Prepared $APK_NAME (versionCode=$VERSION_CODE, sha256=$SHA256)"
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          overwrite_files: true
+          files: |
+            BlackEdition-*.apk
+            black-edition-update.json
+
+      - name: Remove temporary signing key
+        if: always() && startsWith(github.ref, 'refs/tags/')
+        run: rm -f "$RUNNER_TEMP/black-edition-release.jks"
